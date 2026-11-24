@@ -36,7 +36,6 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
-    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -72,6 +71,8 @@ thread_local! {
     /// Texture memory read for hashing and detiling: one per submitting
     /// thread, as large as the largest texture it read.
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// CPU-cached destination for one subresource before its sequential upload.
+    static LINEAR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -200,15 +201,25 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
-            last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+            last.hash = None;
+            last.asked = if with_tiled_copy(self.memory, size, |tiled| self.detile(tiled)) { now } else { 0 };
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
+        last.asked = 0;
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return if committed(self.memory, size) {
+                with_tiled_copy(self.memory, size, |tiled| self.changed(last, tiled))
+            } else {
+                0
+            };
+        }
+        // A single kernel read also verifies that every source page is readable.
+        with_readable_texture(self.memory, size, |tiled| self.changed(last, tiled)).unwrap_or_else(|| {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -216,12 +227,8 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            return 0;
-        }
-        // Read through the kernel, as above: the title may unmap the pages
-        // (evicting a texture a big table lists) while we read them, and a
-        // direct read would fault. The copy is reused, not kept per texture.
-        with_tiled_copy(self.memory, size, |tiled| self.changed(last, tiled))
+            0
+        })
     }
 
     /// After reading the texture's memory into `tiled`: detiles it unless
@@ -234,15 +241,18 @@ impl Staging {
         if last.hash == Some(hash) {
             return size;
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        if self.detile(tiled) {
+            last.hash = Some(hash);
+        } else {
+            last.hash = None;
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    fn detile(&self, tiled: &[u8]) -> bool {
         #[cfg(feature = "diagnostics")]
         if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -251,28 +261,30 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        LINEAR.with_borrow_mut(|linear| self.detile_into(tiled, linear))
+    }
+
+    fn detile_into(&self, tiled: &[u8], linear: &mut Vec<u8>) -> bool {
         let mut packed = Vec::new();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let lines = rows as usize * f.Depth as usize;
-            let len = if self.widened_from.is_some() && lines > 0 {
-                // The last subresource allocation stops at the last row's used bytes.
-                pitch * (lines - 1) + f.Width as usize * 4
-            } else {
-                pitch * lines
-            };
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
+            // GetCopyableFootprints can omit the padding after the final row.
+            let len = (pitch * lines).min((self.size - footprint.Offset) as usize);
+            if linear.len() < len {
+                if linear.try_reserve_exact(len - linear.len()).is_err() {
+                    return false;
+                }
+                linear.resize(len, 0);
+            }
             if let Err(e) = detile_subresource(
                 &self.layout,
                 tiled,
                 mip,
                 slice,
-                linear,
+                &mut linear[..len],
                 pitch,
                 rows as usize,
                 f.Depth as usize,
@@ -280,10 +292,31 @@ impl Staging {
                 &mut packed,
             ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
+            }
+            // SAFETY: the upload is mapped, bounded by its footprint and separate
+            // from the CPU scratch. One sequential write suits write-combined memory.
+            unsafe {
+                std::ptr::copy_nonoverlapping(linear.as_ptr(), self.data.add(footprint.Offset as usize), len);
             }
         }
+        true
     }
+}
+
+fn with_readable_texture<T>(memory: *const u8, size: usize, consume: impl FnOnce(&[u8]) -> T) -> Option<T> {
+    SCRATCH.with_borrow_mut(|scratch| {
+        if scratch.len() < size {
+            // Avoid growing a thread's high-water mark for a texture still streaming.
+            if !committed(memory, size) {
+                return None;
+            }
+            scratch.try_reserve_exact(size - scratch.len()).ok()?;
+            scratch.resize(size, 0);
+        }
+        let tiled = &mut scratch[..size];
+        crate::host::read_into(memory, tiled).then(|| consume(tiled))
+    })
 }
 
 /// Reads a texture for the duration of its detile. Keep the initialized
@@ -413,7 +446,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
@@ -482,6 +514,8 @@ mod tests {
             assert!(tiled[..PAGE].iter().all(|&b| b == 0x32));
             assert!(tiled[PAGE..].iter().all(|&b| b == 0));
         });
+        assert!(with_readable_texture(base.cast(), 2 * PAGE, |_| ()).is_none());
+        assert_eq!(with_readable_texture(base.cast(), PAGE, |bytes| bytes[PAGE - 1]), Some(0x32));
         // SAFETY: this reservation is no longer used.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
