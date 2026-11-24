@@ -241,6 +241,10 @@ mod show_tests {
     }
 }
 
+pub(crate) fn show_requested() -> bool {
+    show_spec().is_some()
+}
+
 /// The last render target bound that matches [`show_spec`].
 static SHOWN: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
     std::sync::Mutex::new(None);

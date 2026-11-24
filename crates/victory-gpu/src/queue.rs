@@ -152,13 +152,17 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a `PresentX` call (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`,
+/// 0x48 bytes): frame token, resource array, view rects, color space,
+/// extended descriptors, and plane flags.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -277,10 +281,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Retains each plane's first resource until this present reaches the queue.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -289,27 +290,27 @@ extern "system" fn present(
 ) -> HRESULT {
     // Read now: the parameters are the title's, maybe on its stack. The
     // frame is shown in the queue's order, after the work before it.
-    let plane = if planes > 0 {
-        // SAFETY: the title passes `planes` plane descriptions.
-        unsafe { plane_parameters.as_ref() }
-    } else {
-        None
-    };
-    let resource = plane
-        .filter(|plane| plane.count > 0 && !plane.resources.is_null())
-        // SAFETY: the plane lists `count` resources.
-        .map(|plane| unsafe { *plane.resources })
-        .filter(|resource| !resource.is_null())
-        .map(object::Held::new);
-    queue(this)
-        .timeline
-        .submit(Op::Run(Box::new(move || show(resource))));
+    let mut resources = Vec::new();
+    if planes > 0 && !plane_parameters.is_null() {
+        // SAFETY: the title supplies the array for the duration of this call.
+        let descriptions = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        for plane in descriptions {
+            if plane.count != 0 && !plane.resources.is_null() {
+                // SAFETY: a nonempty plane lists at least one resource.
+                let resource = unsafe { *plane.resources };
+                if !resource.is_null() {
+                    resources.push(object::Held::new(resource));
+                }
+            }
+        }
+    }
+    queue(this).timeline.submit(Op::Run(Box::new(move || show(resources))));
     S_OK
 }
 
 /// A present, once the queue's work before it has run: counts the frame
 /// and shows the plane's first resource.
-fn show(resource: Option<object::Held>) {
+fn show(resources: Vec<object::Held>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -344,22 +345,23 @@ fn show(resource: Option<object::Held>) {
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
-    if let Some(resource) = resource.as_ref().map(object::Held::get)
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+    if let Some(host) = crate::host::host() {
+        let textures: Vec<_> = resources.iter().filter_map(|held| {
+            crate::resource::host_copy(held.get()).map(|texture| (held, texture))
+        }).collect();
+        let sources: Vec<_> = textures.iter().map(|(_, texture)| {
+            (&texture.texture, texture.state.load(Ordering::Relaxed))
+        }).collect();
+        if !sources.is_empty() {
+            let shown = host.present(&sources, frame);
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, textures[0].0.get(), sources[0].1, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
-    let _ = resource;
+    let _ = resources;
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
@@ -724,6 +726,7 @@ mod tests {
                 token: 1,
                 count: 1,
                 resources: resources.as_ptr(),
+                _rest: [0; 6],
             });
             assert_eq!(present(waits)(waits, 1, &*plane, std::ptr::null()), S_OK);
         }
