@@ -56,6 +56,7 @@ pub(crate) struct Host {
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
+    rtv_formats: Mutex<std::collections::HashMap<i32, bool>>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
     /// Detached host lists whose submissions finished, ready to reuse.
@@ -304,6 +305,7 @@ fn create() -> windows::core::Result<Host> {
             dsv_size,
             next_dsv: AtomicU32::new(0),
             messages,
+            rtv_formats: Mutex::default(),
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             free_lists: Mutex::default(),
@@ -958,7 +960,27 @@ impl Host {
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        // The host may have created a texture without its console render-target flag.
+        let resource_desc = resource.map(|r| unsafe { r.GetDesc() });
+        if resource_desc.is_some_and(|d| !d.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+            return None;
+        }
+        let format = desc.map(|d| d.Format).filter(|f| *f != DXGI_FORMAT_UNKNOWN)
+            .or_else(|| resource_desc.map(|d| d.Format))?;
+        let mut formats = self.rtv_formats.lock().unwrap_or_else(|e| e.into_inner());
+        let supported = *formats.entry(format.0).or_insert_with(|| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+            // SAFETY: the query writes the format support structure of the indicated size.
+            (unsafe {
+                self.device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(), size_of_val(&support) as u32).is_ok()
+            }) && support.Support1.contains(D3D12_FORMAT_SUPPORT1_RENDER_TARGET)
+        });
+        drop(formats);
+        if !supported {
+            return None;
+        }
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource or a typed null view.
         unsafe {
@@ -966,7 +988,7 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            Some(handle)
         }
     }
 
@@ -3304,7 +3326,7 @@ mod present_plane_tests {
                     .unwrap();
                 let texture = texture.unwrap();
                 list.list
-                    .ClearRenderTargetView(host.rtv(Some(&texture), None), color, None);
+                    .ClearRenderTargetView(host.rtv(Some(&texture), None).unwrap(), color, None);
                 texture
             }
         };

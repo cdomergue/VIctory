@@ -75,6 +75,7 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    unsupported_target: bool,
     depth: Option<DepthTarget>,
     /// The current draw also samples its read-only depth target.
     depth_sampled: bool,
@@ -290,6 +291,7 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.unsupported_target = false;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -302,17 +304,25 @@ impl State {
             if record.resource.is_null() {
                 // A typed null RTV discards writes without changing the output slot.
                 if let Some(desc) = record.desc() {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    if let Some(view) = host.rtv(None, Some(&desc)) {
+                        rtvs.push(view);
+                    } else {
+                        self.unsupported_target = true;
+                    }
                 }
                 continue;
             }
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            let Some(view) = host.rtv(Some(texture), record.desc().as_ref()) else {
+                self.unsupported_target = true;
+                continue;
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            rtvs.push(view);
         }
         self.depth = None;
         self.depth_sampled = false;
@@ -383,6 +393,9 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        if self.unsupported_target {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -1869,7 +1882,7 @@ mod diagnostics_tests {
         crate::list::ensure_state(&list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
         // SAFETY: open list, live target and graphics pipeline.
         unsafe {
-            l.ClearRenderTargetView(host.rtv(Some(color), None), &[0.0, 0.0, 1.0, 1.0], None);
+            l.ClearRenderTargetView(host.rtv(Some(color), None).unwrap(), &[0.0, 0.0, 1.0, 1.0], None);
             l.SetGraphicsRootSignature(&root);
             l.SetPipelineState(&pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
