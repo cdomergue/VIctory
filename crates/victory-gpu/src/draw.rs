@@ -75,6 +75,8 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    target_views: Vec<Option<D3D12_RENDER_TARGET_VIEW_DESC>>,
     unsupported_target: bool,
     depth: Option<DepthTarget>,
     /// The current draw also samples its read-only depth target.
@@ -291,6 +293,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        #[cfg(feature = "diagnostics")]
+        self.target_views.clear();
         self.unsupported_target = false;
         let mut rtvs = Vec::new();
         for &h in handles {
@@ -322,6 +326,10 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            #[cfg(feature = "diagnostics")]
+            if crate::scene_color::enabled() {
+                self.target_views.push(record.desc());
+            }
             rtvs.push(view);
         }
         self.depth = None;
@@ -335,6 +343,8 @@ impl State {
             });
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_scene_depth(record.resource);
             Some(host.dsv(texture, desc.as_ref()))
         });
         // SAFETY: an open list; the views were just made.
@@ -736,6 +746,8 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    crate::scene_color::note_draw(self.depth.map_or(0, |d| d.resource), &self.targets, &self.target_views);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1004,6 +1016,8 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth.map_or(0, |d| d.resource), &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
@@ -1103,6 +1117,8 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth.map_or(0, |d| d.resource), &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
@@ -1239,6 +1255,8 @@ impl State {
                 )
             };
             prepared.after_draw(list);
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth.map_or(0, |d| d.resource), &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -1320,6 +1338,8 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            #[cfg(feature = "diagnostics")]
+            crate::scene_color::note_draw(self.depth.map_or(0, |d| d.resource), &self.targets, &self.target_views);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true

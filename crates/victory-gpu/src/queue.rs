@@ -349,6 +349,11 @@ fn show(resources: Vec<object::Held>) {
         let textures: Vec<_> = resources.iter().filter_map(|held| {
             crate::resource::host_copy(held.get()).map(|texture| (held, texture))
         }).collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::capture::sample_scene_depth(frame);
+            crate::scene_color::sample(host, frame, &resources);
+        }
         let sources: Vec<_> = textures.iter().map(|(_, texture)| {
             (&texture.texture, texture.state.load(Ordering::Relaxed))
         }).collect();

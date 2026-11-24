@@ -659,6 +659,14 @@ impl Host {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn capture_completed(&self) -> bool {
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the host owns the fence throughout this query.
+        let value = unsafe { self.fence.GetCompletedValue() };
+        value != u64::MAX && value >= *submitted
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1203,7 +1211,15 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        self.track_texture_state(copy, wanted).map(|before| (texture, before))
+    }
+
+    pub(crate) fn track_texture_state(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -1212,7 +1228,7 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }
@@ -2277,6 +2293,10 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    #[cfg(feature = "diagnostics")]
+    preview: Option<crate::present_depth::PreviewUpload>,
+    #[cfg(feature = "diagnostics")]
+    saved_previews: [u8; 2],
     compositor: Option<Compositor>,
 }
 
@@ -2341,7 +2361,7 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, preview_mode: &str) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -2403,7 +2423,7 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | VIctory{preview_mode} {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -2479,7 +2499,11 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (width, height, format);
+                    #[cfg(feature = "diagnostics")]
+                    { p.preview = None; }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
@@ -2494,6 +2518,20 @@ impl Host {
         } else {
             p.sync_color_space(false);
         }
+        #[cfg(feature = "diagnostics")]
+        let new_preview = match crate::scene_color::preview(frame).or_else(|| crate::capture::scene_depth_preview(frame)) {
+            Some(image) if p.preview.as_ref().is_none_or(|v| (v.frame, v.color) != (image.frame, image.color)) => {
+                p.preview = crate::present_depth::PreviewUpload::new(self, width, height, format, &image);
+                p.preview.is_some()
+            }
+            Some(_) => false,
+            None => { p.preview = None; false }
+        };
+        #[cfg(feature = "diagnostics")]
+        let capture_pair = p.preview.as_ref().is_some_and(|v| {
+            crate::capture::folder().is_some() && (crate::capture::wanted(frame)
+                || (new_preview && p.saved_previews[usize::from(v.color)] < 3))
+        });
         // Leave the copy list closed if compositor initialization fails.
         let compositor = if planes.len() > 1 {
             if p.compositor.as_ref().is_none_or(|c| c.format != format) {
@@ -2532,7 +2570,7 @@ impl Host {
                 list.ResourceBarrier(&before);
                 list.CopyResource(&back, texture);
                 #[cfg(feature = "diagnostics")]
-                let capture = crate::capture::wanted(frame)
+                let capture = (crate::capture::wanted(frame) || capture_pair)
                     .then(|| crate::capture::read_back(&self.device, list, texture))
                     .flatten();
                 #[cfg(feature = "diagnostics")]
@@ -2647,7 +2685,7 @@ impl Host {
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
                     )]);
-                    let capture = crate::capture::wanted(frame)
+                    let capture = (crate::capture::wanted(frame) || capture_pair)
                         .then(|| crate::capture::read_back(&self.device, list, &back))
                         .flatten();
                     let probe = crate::capture::probe(&self.device, list, &back);
@@ -2690,14 +2728,41 @@ impl Host {
                 crate::capture::show(list, &back);
                 list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
             }
+            #[cfg(feature = "diagnostics")]
+            let preview_capture = p.preview.as_ref().and_then(|upload| {
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                upload.copy_to(list, &back);
+                if capture_pair {
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    let read = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+                    read.map(|(b, f)| (upload.color, b, f))
+                } else {
+                    list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
+                    None
+                }
+            });
             p.copy.close();
             self.execute(&[&p.copy]);
+            #[cfg(feature = "diagnostics")]
+            if let Some((color, buffer, footprint)) = preview_capture {
+                crate::capture::save_presented_preview(frame, color, &buffer, &footprint);
+                p.saved_previews[usize::from(color)] = p.saved_previews[usize::from(color)].saturating_add(1);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            #[cfg(feature = "diagnostics")]
+            let mode = match p.preview.as_ref().map(|v| v.color) {
+                Some(true) => " [scene color]",
+                Some(false) => " [scene depth]",
+                None => "",
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let mode = "";
+            p.meter.frame(p.hwnd, mode);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -2749,6 +2814,10 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                preview: None,
+                #[cfg(feature = "diagnostics")]
+                saved_previews: [0; 2],
                 compositor: None,
             };
             p.sync_color_space(display_hdr_info().is_some());

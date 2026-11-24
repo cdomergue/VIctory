@@ -6536,7 +6536,9 @@ impl<'a> Lower<'a> {
             if kind == 5 && (*unorm || op == 63 || op == 81) {
                 return Err("a cube sample with texel coordinates, gradients or a level query");
             }
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // Array slices are not spatial coordinates in a DXIL CalculateLOD query.
+            let active_coords = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(active_coords) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }

@@ -155,8 +155,12 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    let count = (self.targets.NumRenderTargets as usize).min(8);
+                    for f in &mut self.targets.RTFormats[..count] {
                         f.0 = crate::resource::target_format(f.0 as u32) as i32;
+                    }
+                    for f in &mut self.targets.RTFormats[count..] {
+                        *f = DXGI_FORMAT_UNKNOWN;
                     }
                 }
                 16 => {
@@ -511,7 +515,11 @@ impl HostPipeline {
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                pInputElementDescs: g.inputs.as_ptr(),
+                pInputElementDescs: if g.inputs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    g.inputs.as_ptr()
+                },
                 NumElements: g.inputs.len() as u32,
             },
             IBStripCutValue: g.strip_cut,

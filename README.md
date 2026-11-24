@@ -13,6 +13,30 @@ it can and on first use where it must (shaders). See
 The Windows executable can also be launched under Proton on x86-64 Linux. See
 [Running with the Proton launcher](docs/proton-launcher.md).
 
+## Series S scene preview on Windows
+
+Build with `cargo build --locked --profile diag --features diagnostics -p victory`.
+This branch combines [cat4blep's scene previews](https://github.com/cat4blep/VIctory/commit/45e524c2d78fe058e2d3fe99f29f6067a1ed1915)
+with multi-plane presentation and render-target checks for Series S. It includes
+the array-texture LOD correction and pipeline descriptor fixes from
+[justr4mzi's fork](https://github.com/justr4mzi/VIctory). The RTX test uses the
+shader loop limit from [AbuAce's capture report](https://github.com/AbuAce/VIctory/blob/26e9990722559c87d0470e0274506b6a30313830/docs/rtx-5090-test-report.md).
+
+With the game directory and save configured, run from PowerShell:
+
+```powershell
+$env:VICTORY_PREVIEW_SCENE_COLOR = '1'
+$env:VICTORY_PREVIEW_SCENE_DEPTH = '1'
+$env:VICTORY_SHADER_LOOP_LIMIT = '32'
+$env:VICTORY_SKIP_WAVE64 = 'mesh,compute'
+.\target\diag\victory.exe run "$env:VICTORY_GAME_DIR\game_scarlett_master.exe" --execute --console series-s
+```
+
+Menus use the game's usual output. When the renderer finds a scene target,
+the window title identifies the color or grayscale depth preview. A preview
+can show unlit geometry or individual effects. Set `VICTORY_CAPTURE` to a
+directory outside the checkout to save matching native and preview frames.
+
 ## Status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
@@ -203,6 +227,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_PREVIEW_SCENE_COLOR=1` | Shows a sampled intermediate scene color target in the game window. The title bar identifies the preview. With `VICTORY_CAPTURE`, the first three samples and selected frames are saved alongside normal captures. |
+| `VICTORY_PREVIEW_SCENE_DEPTH=1` | Shows sampled scene depth in grayscale. With both previews enabled, a recent color sample takes priority. |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_SHOW_TARGET=2560x1440-f28` | shows the last render target of that size and DXGI format each frame instead of the title's frame (copied 1:1 to the top left, only when its format matches the window's), e.g. the world's geometry while its lit image is black |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
