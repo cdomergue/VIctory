@@ -17,7 +17,9 @@ The Windows executable can also be launched under Proton on x86-64 Linux. See
 
 Build with `cargo build --locked --profile diag --features diagnostics -p victory`.
 This branch combines [cat4blep's scene previews](https://github.com/cat4blep/VIctory/commit/45e524c2d78fe058e2d3fe99f29f6067a1ed1915)
-with multi-plane presentation and render-target checks for Series S. It includes
+with multi-plane presentation and render-target checks for Series S. On adapters that
+lack the console's packed 16-bit target formats, [PR #89](https://github.com/Marvisak/VIctory/pull/89)
+uses an RGBA8 texture; this branch also converts cropped readbacks to the guest format. It includes
 the array-texture LOD correction and pipeline descriptor fixes from
 [justr4mzi's fork](https://github.com/justr4mzi/VIctory). The RTX test uses the
 shader loop limit from [AbuAce's capture report](https://github.com/AbuAce/VIctory/blob/26e9990722559c87d0470e0274506b6a30313830/docs/rtx-5090-test-report.md).

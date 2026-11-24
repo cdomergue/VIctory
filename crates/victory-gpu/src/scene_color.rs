@@ -77,6 +77,7 @@ fn dimensions(desc: &D3D12_RESOURCE_DESC) -> bool {
     let h = u64::from(desc.Height);
     desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && desc.SampleDesc.Count == 1
+        && capture::is_scene_size(desc.Width, desc.Height)
         && desc.DepthOrArraySize == 1
         && (640..=4096).contains(&desc.Width)
         && (360..=2304).contains(&h)
@@ -87,7 +88,7 @@ fn format(raw: DXGI_FORMAT, view: Option<DXGI_FORMAT>) -> Option<DXGI_FORMAT> {
     let typed = view.unwrap_or(raw);
     matches!(
         (raw.0, typed.0),
-        (9..=10, 10) | (23..=24, 24) | (26, 26) | (27..=29, 28..=29) | (87 | 90 | 91, 87 | 91)
+        (9..=10, 10) | (23..=24, 24) | (26, 26) | (33..=34, 34) | (27..=29, 28..=29) | (87 | 90 | 91, 87 | 91)
     )
     .then_some(typed)
 }

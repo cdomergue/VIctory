@@ -519,6 +519,7 @@ struct Readback {
     lines: usize,
     row_bytes: usize,
     total: usize,
+    packed_format: Option<u32>,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -784,7 +785,18 @@ impl Host {
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
-                let written = if rb.dst_pitch == rb.src_pitch {
+                let written = if let Some(format) = rb.packed_format {
+                    let mut packed = vec![0; rb.row_bytes];
+                    for line in 0..rb.lines {
+                        // SAFETY: each row spans four staging bytes per two destination bytes.
+                        let rgba = unsafe { std::slice::from_raw_parts((rb.src + line * rb.src_pitch) as *const u8, rb.row_bytes * 2) };
+                        crate::resource::pack_rgba8_to_16(format, rgba, &mut packed);
+                        let dst = rb.dst + line * rb.dst_pitch;
+                        crate::watch::writing(dst, packed.len());
+                        write_mapped(dst as *mut u8, packed.as_ptr(), packed.len());
+                    }
+                    rb.row_bytes * rb.lines
+                } else if rb.dst_pitch == rb.src_pitch {
                     crate::watch::writing(rb.dst, rb.total);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
                     rb.total
@@ -1388,6 +1400,7 @@ impl HostList {
         lines: usize,
         row_bytes: usize,
         total: usize,
+        packed_format: Option<u32>,
     ) {
         self.deferred().readbacks.push(Readback {
             dst: dst as usize,
@@ -1397,6 +1410,7 @@ impl HostList {
             lines,
             row_bytes,
             total,
+            packed_format,
         });
     }
 

@@ -441,6 +441,11 @@ pub(crate) fn scene_depth_preview(frame: u64) -> Option<Arc<ScenePreview>> {
         .cloned()
 }
 
+/// In Series S the 4K surfaces carry menus and credits while the scene is at most 1080p.
+pub(crate) fn is_scene_size(width: u64, height: u32) -> bool {
+    crate::console::current() != crate::console::Console::SeriesS || (width <= 1920 && height <= 1080)
+}
+
 /// Keep the largest eligible depth target bound for the frame being built.
 pub(crate) fn note_scene_depth(resource: crate::object::This) {
     if !scene_depth_on() {
@@ -470,6 +475,7 @@ pub(crate) fn note_scene_depth(resource: crate::object::This) {
         || desc.SampleDesc.Count != 1
         || !desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
         || !matches!(desc.Format.0, 19..=22 | 39..=47)
+        || !is_scene_size(desc.Width, desc.Height)
         || !(640..=4096).contains(&width)
         || !(360..=2304).contains(&height)
         || !(14 * height..=24 * height).contains(&(10 * width))
@@ -896,6 +902,7 @@ pub(crate) fn scene_grid_has_color(buffer: &ID3D12Resource, format: DXGI_FORMAT)
             let packed = u32::from_le_bytes(pixel[..4].try_into().expect("grid pixel"));
             let rgb = match format.0 {
                 10 => [0, 2, 4].map(|i| half(u16::from_le_bytes([pixel[i], pixel[i + 1]]))),
+                34 => [half(u16::from_le_bytes([pixel[0],pixel[1]])), half(u16::from_le_bytes([pixel[2],pixel[3]])), 0.0],
                 24 => [0, 10, 20].map(|i| ((packed >> i) & 0x3ff) as f32 / 1023.0),
                 26 => [
                     small_float(packed & 0x7ff, 6),
