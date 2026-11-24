@@ -221,11 +221,7 @@ impl Staging {
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
-        SCRATCH.with_borrow_mut(|tiled| {
-            tiled.resize(size, 0);
-            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
-            self.changed(last, tiled)
-        })
+        with_tiled_copy(self.memory, size, |tiled| self.changed(last, tiled))
     }
 
     /// After reading the texture's memory into `tiled`: detiles it unless
@@ -248,7 +244,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -292,7 +288,7 @@ impl Staging {
 
 /// Reads a texture for the duration of its detile. Keep the initialized
 /// length so alternating large and small textures do not re-zero the tail.
-fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
+fn with_tiled_copy<T>(memory: *const u8, size: usize, consume: impl FnOnce(&[u8]) -> T) -> T {
     SCRATCH.with_borrow_mut(|read| {
         if size > read.len() {
             read.reserve_exact(size - read.len());
@@ -300,8 +296,8 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
         }
         let tiled = &mut read[..size];
         crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
-        detile(tiled);
-    });
+        consume(tiled)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

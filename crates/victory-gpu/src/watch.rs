@@ -71,6 +71,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         )
     } != 0;
     let guarded = if failed {
+        // Section views cannot be write-watched. A texture in a view uses
+        // its content hash, so there is no reason to walk its allocation.
+        if !guarded && mapped(start) {
+            return None;
+        }
         count = 0;
         match by_allocation(first * PAGE, last * PAGE, &mut j.found) {
             Some(pages) => pages,
@@ -417,6 +422,8 @@ mod tests {
         let view = unsafe { MapViewOfFile(section, FILE_MAP_READ, 0, 0, PAGE) };
         assert!(!view.Value.is_null());
         assert!(mapped(view.Value as usize + 13));
+        let at = view.Value as usize;
+        assert!(writes(at + 13, at + PAGE, false).is_none());
         // SAFETY: our successful mapping and its section handle.
         unsafe {
             UnmapViewOfFile(view);

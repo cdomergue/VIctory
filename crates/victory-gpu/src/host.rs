@@ -2535,7 +2535,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let new_preview = match crate::scene_color::preview(frame).or_else(|| crate::capture::scene_depth_preview(frame)) {
             Some(image) if p.preview.as_ref().is_none_or(|v| (v.frame, v.color) != (image.frame, image.color)) => {
-                p.preview = crate::present_depth::PreviewUpload::new(self, width, height, format, &image);
+                p.preview = crate::present_depth::PreviewUpload::update(
+                    self, p.preview.take(), width, height, format, &image,
+                );
                 p.preview.is_some()
             }
             Some(_) => false,
