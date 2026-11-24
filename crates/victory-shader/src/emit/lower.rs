@@ -164,6 +164,8 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    /// Loaded resource-heap descriptors used by a buffer store or atomic.
+    written_heap_buffers: HashSet<(Site, u8)>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -443,6 +445,27 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let scalar: HashMap<_, _> = x.res.scalar.iter().copied().collect();
+        let mut written_heap_buffers = HashSet::new();
+        for d in &x.res.descriptors {
+            let inst = &p.blocks[d.site.0].insts[d.site.1];
+            let name = inst.name();
+            if d.role != Role::Resource
+                || !matches!(inst.fields, Fields::Buffer { .. })
+                || !(name.starts_with("buffer_store_") || name.starts_with("buffer_atomic_"))
+            {
+                continue;
+            }
+            for leaf in d.source.leaves() {
+                if let Source::Loaded { load, first } = leaf
+                    && let Some(address) = scalar.get(load)
+                    && let Some(param) = x.native.layout.get(address.param)
+                    && param.root == RootType::ResourceHeap
+                {
+                    written_heap_buffers.insert((*load, *first));
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -469,7 +492,8 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            written_heap_buffers,
+            scalar,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -2840,8 +2864,12 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        let uav = self.written_heap_buffer(src)
+            || kind.is_some_and(|u| {
+                u.root == RootType::Table && u.kind == ResourceType::Uav && u.stride == 0
+            });
+        if uav || kind.is_some_and(|u| u.kind == ResourceType::Srv) {
+            let h = self.handle(site, src, false, (if uav { 11 | 0x1000 } else { 11 }, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -2955,6 +2983,7 @@ impl<'a> Lower<'a> {
         let un = ui.name();
         let uav = un.contains("store")
             || un.contains("atomic")
+            || self.written_heap_buffer(&src)
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
@@ -3245,6 +3274,16 @@ impl<'a> Lower<'a> {
                 Ok((address.offset, x))
             }
             _ => Ok((0, None)),
+        }
+    }
+
+    fn written_heap_buffer(&self, src: &Source) -> bool {
+        match src {
+            Source::Loaded { load, first } => self.written_heap_buffers.contains(&(*load, *first)),
+            Source::Phi { args, .. } => {
+                !args.is_empty() && args.iter().all(|s| self.written_heap_buffer(s))
+            }
+            _ => false,
         }
     }
 
@@ -6103,7 +6142,10 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = store
+            || atomic.is_some()
+            || self.written_heap_buffer(src)
+            || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {

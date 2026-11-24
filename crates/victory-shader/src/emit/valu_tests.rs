@@ -69,8 +69,12 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_buffer_cs(body, RootType::Table)
+}
+
+fn build_buffer_cs(body: &[u32], root: RootType) -> HostShader {
     let mut words = Vec::new();
-    // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
+    // s[4:5] points to the descriptor at heap index 0.
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
     words.extend_from_slice(&s_load_dwordx4(8, 4));
     // Copy root constants s0..s3 into v1..v4 so VALU instructions operate on
@@ -97,7 +101,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
                 slot: 0,
             },
             RootParam {
-                root: RootType::Table,
+                root,
                 table_offset_dwords: 0,
                 sgprs: 1,
                 base_register: 0,
@@ -105,16 +109,20 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
                 slot: 1,
             },
         ],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 4,
-            slot: 1,
-        }],
+        used: if root == RootType::Table {
+            vec![UsedResource {
+                kind: ResourceType::Uav,
+                root,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }]
+        } else {
+            Vec::new()
+        },
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
             threads: [1, 1, 1],
@@ -206,6 +214,32 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn heap_buffer_loads_read_the_uav_written_by_the_shader() {
+    let cases = [[0x1234_5678, 0, 0, 0], [0x89ab_cdef, 0, 0, 0]];
+    for (root, scalar) in [
+        (RootType::ResourceHeap, false),
+        (RootType::ResourceHeap, true),
+        (RootType::Table, true),
+    ] {
+        // Store the input, load the same dword through the same descriptor,
+        // then invert it so the first store alone cannot satisfy the test.
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        if scalar {
+            // s_buffer_load_dword s12, s[8:11], 0; v_mov_b32 v0, s12
+            body.extend([0xf420_0304, 125 << 25, vop1(1, 0, sgpr(12))]);
+        } else {
+            // buffer_load_dword v0, off, s[8:11], 0
+            body.extend([0xe030_0000, 0x8002_0000]);
+        }
+        body.push(vop1(0x037, 0, vgpr(0))); // v_not_b32 v0, v0
+        let shader = build_buffer_cs(&body, root);
+        run_cases(&shader, &cases, |host, _, inputs, result| {
+            assert_eq!(result, !inputs[0], "{host}, {root:?}, scalar={scalar}");
+        });
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
